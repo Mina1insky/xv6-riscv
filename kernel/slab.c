@@ -514,18 +514,26 @@ kmem_cache_free(struct kmem_cache *cache, void *obj)
   else
     slab_move(cache, s, SLAB_PARTIAL);
 
-  // Keep one empty slab hot, return the rest to Buddy.
-  if (cache->free.count > 1) {
-    reap = cache->free.head;
-    slab_list_del(&cache->free, reap, SLAB_FREE);
-    reap->magic = 0;
-    cache->nr_reap++;
+  // Reclaim empty slabs.  While the cache is active, keep one empty slab
+  // hot.  Once no slab is in use at all, return every empty slab so that
+  // free physical page accounting (e.g. usertests) stays exact.
+  for (;;) {
+    int idle = cache->partial.count == 0 && cache->full.count == 0;
+
+    if (cache->free.count > 1 || (idle && cache->free.count > 0)) {
+      reap = cache->free.head;
+      slab_list_del(&cache->free, reap, SLAB_FREE);
+      reap->magic = 0;
+      cache->nr_reap++;
+      release(&cache->lock);
+      buddy_free(reap, 0);
+      acquire(&cache->lock);
+      continue;
+    }
+    break;
   }
 
   release(&cache->lock);
-
-  if (reap)
-    buddy_free(reap, 0);
 }
 
 uint
@@ -588,6 +596,32 @@ kmem_cache_dump(struct kmem_cache *cache)
 }
 
 #ifdef SLAB_SELFTEST
+uint64
+kmem_cache_live(struct kmem_cache *cache)
+{
+  uint64 n;
+
+  if (cache == 0 || !cache->used || !slab_ready)
+    return 0;
+  acquire(&cache->lock);
+  n = cache->live_objects;
+  release(&cache->lock);
+  return n;
+}
+
+uint64
+kmem_cache_grow_count(struct kmem_cache *cache)
+{
+  uint64 n;
+
+  if (cache == 0 || !cache->used || !slab_ready)
+    return 0;
+  acquire(&cache->lock);
+  n = cache->nr_grow;
+  release(&cache->lock);
+  return n;
+}
+
 static uint64 slab_test_rng = 0x1234abcdULL;
 static void *slab_test_rec[3 * SLAB_MAX_OBJECTS];
 
@@ -712,17 +746,24 @@ slab_test_cross(void)
   if (!kmem_cache_check(c))
     panic("slab test t3 check");
 
-  // Interleave frees: full -> partial -> free.
-  for (i = 0; i < n + 3; i += 2)
+  // rec[0..n-1] fill the first slab; rec[n..n+2] are in the second.
+  // Emptying the second slab leaves the cache active (first slab full),
+  // so one empty slab is kept hot.
+  for (i = n; i < n + 3; i++)
     kmem_cache_free(c, slab_test_rec[i]);
+  if (c->full.count != 1 || c->partial.count != 0 || c->free.count != 1)
+    panic("slab test t3 hot page");
   if (!kmem_cache_check(c))
     panic("slab test t3 mid check");
-  for (i = 1; i < n + 3; i += 2)
+
+  // Emptying the first slab makes the whole cache idle; every empty slab
+  // must then be returned to Buddy.
+  for (i = 0; i < n; i++)
     kmem_cache_free(c, slab_test_rec[i]);
   if (c->live_objects != 0)
     panic("slab test t3 restore");
-  if (c->free.count != 1)
-    panic("slab test t3 hot page");
+  if (c->free.count != 0 || c->partial.count != 0 || c->full.count != 0)
+    panic("slab test t3 idle reap");
   if (!kmem_cache_check(c))
     panic("slab test t3 final check");
   kmem_cache_shrink(c);
