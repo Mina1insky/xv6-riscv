@@ -60,6 +60,11 @@ void            ireclaim(int);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+void*           buddy_alloc(int);
+void            buddy_free(void *, int);
+int             buddy_check(void);
+void            buddy_dump(void);
+uint64          buddy_free_pages(void);
 
 // log.c
 void            initlog(int, struct superblock*);
