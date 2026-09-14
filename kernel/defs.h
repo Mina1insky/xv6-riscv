@@ -3,6 +3,7 @@ struct buf;
 struct context;
 struct file;
 struct inode;
+struct kmem_cache;
 struct pipe;
 struct proc;
 struct spinlock;
@@ -66,6 +67,15 @@ int             buddy_check(void);
 void            buddy_dump(void);
 uint64          buddy_free_pages(void);
 
+// slab.c
+void            slabinit(void);
+struct kmem_cache* kmem_cache_create(char*, uint, uint);
+void*           kmem_cache_alloc(struct kmem_cache*);
+void            kmem_cache_free(struct kmem_cache*, void*);
+uint            kmem_cache_shrink(struct kmem_cache*);
+int             kmem_cache_check(struct kmem_cache*);
+void            kmem_cache_dump(struct kmem_cache*);
+
 // log.c
 void            initlog(int, struct superblock*);
 void            log_write(struct buf*);
@@ -73,6 +83,7 @@ void            begin_op(void);
 void            end_op(void);
 
 // pipe.c
+void            pipeinit(void);
 int             pipealloc(struct file**, struct file**);
 void            pipeclose(struct pipe*, int);
 int             piperead(struct pipe*, uint64, int);
