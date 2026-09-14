@@ -75,6 +75,10 @@ void            kmem_cache_free(struct kmem_cache*, void*);
 uint            kmem_cache_shrink(struct kmem_cache*);
 int             kmem_cache_check(struct kmem_cache*);
 void            kmem_cache_dump(struct kmem_cache*);
+#ifdef SLAB_SELFTEST
+uint64          kmem_cache_live(struct kmem_cache*);
+uint64          kmem_cache_grow_count(struct kmem_cache*);
+#endif
 
 // log.c
 void            initlog(int, struct superblock*);

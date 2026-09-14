@@ -19,6 +19,23 @@ struct pipe {
   int writeopen; // write fd is still open
 };
 
+static struct kmem_cache *pipe_cache;
+
+#ifdef SLAB_SELFTEST
+static int pipe_dump_budget = 6;
+#endif
+
+void
+pipeinit(void)
+{
+  pipe_cache = kmem_cache_create("pipe", sizeof(struct pipe), 0);
+  if (pipe_cache == 0)
+    panic("pipe cache");
+#ifdef SLAB_SELFTEST
+  kmem_cache_dump(pipe_cache);
+#endif
+}
+
 int
 pipealloc(struct file **f0, struct file **f1)
 {
@@ -28,7 +45,7 @@ pipealloc(struct file **f0, struct file **f1)
   *f0 = *f1 = 0;
   if ((*f0 = filealloc()) == 0 || (*f1 = filealloc()) == 0)
     goto bad;
-  if ((pi = (struct pipe *)kalloc()) == 0)
+  if ((pi = (struct pipe *)kmem_cache_alloc(pipe_cache)) == 0)
     goto bad;
   pi->readopen = 1;
   pi->writeopen = 1;
@@ -47,7 +64,7 @@ pipealloc(struct file **f0, struct file **f1)
 
 bad:
   if (pi)
-    kfree((char *)pi);
+    kmem_cache_free(pipe_cache, pi);
   if (*f0)
     fileclose(*f0);
   if (*f1)
@@ -68,7 +85,17 @@ pipeclose(struct pipe *pi, int writable)
   }
   if (pi->readopen == 0 && pi->writeopen == 0) {
     release(&pi->lock);
-    kfree((char *)pi);
+    kmem_cache_free(pipe_cache, pi);
+#ifdef SLAB_SELFTEST
+    if (!kmem_cache_check(pipe_cache))
+      panic("pipe cache check");
+    if (pipe_dump_budget > 0 && kmem_cache_grow_count(pipe_cache) >= 2 &&
+        kmem_cache_live(pipe_cache) == 0) {
+      pipe_dump_budget--;
+      printk("pipe cache with no live pipes:\n");
+      kmem_cache_dump(pipe_cache);
+    }
+#endif
   } else
     release(&pi->lock);
 }
