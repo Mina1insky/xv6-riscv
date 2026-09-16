@@ -564,6 +564,7 @@ kmem_cache_shrink(struct kmem_cache *cache)
     s = cache->free.head;
     slab_list_del(&cache->free, s, SLAB_FREE);
     s->magic = 0;
+    cache->nr_reap++;
     release(&cache->lock);
 
     buddy_free(s, 0);
@@ -946,6 +947,7 @@ slab_test_buddy(void)
 {
   struct kmem_cache *c;
   uint64 before = buddy_free_pages();
+  uint64 reap0;
   uint n, i;
 
   c = kmem_cache_create("t6", 128, 0);
@@ -970,8 +972,11 @@ slab_test_buddy(void)
     panic("slab test t6 hot");
 
   // shrink returns exactly the empty slab.
+  reap0 = c->nr_reap;
   if (kmem_cache_shrink(c) != 1)
     panic("slab test t6 shrink");
+  if (c->nr_reap != reap0 + 1)
+    panic("slab test t6 reap");
   if (buddy_free_pages() != before - 1)
     panic("slab test t6 shrink pages");
 

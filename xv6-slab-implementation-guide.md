@@ -12,7 +12,7 @@
 |---|---|
 | 基线 | `buddy-v1` = `6eb4dad`（Buddy 实现 + 测试文档） |
 | 开发分支 | `slab-dev` |
-| 提交 | `99ef4f3` mm: add slab allocator core with checks and selftests<br>`453db5a` mm: reclaim empty slabs when the cache is idle<br>`5301054` ipc: allocate pipe objects from a slab cache<br>`8b1ba86` docs: record slab implementation and verification results<br>`5a4e89c` test: avoid uninitialized pointer reads in slab T2<br>`9108f2f` mm: add quiescent slab cache destruction<br>`1ad4b39` test: cover slab lifecycle layout and repeated reclaim<br>`92eabdc` test: stress pipe slab allocation on multiple harts<br>docs: record slab completion and verification results（本文件所在提交） |
+| 提交 | `99ef4f3` mm: add slab allocator core with checks and selftests<br>`453db5a` mm: reclaim empty slabs when the cache is idle<br>`5301054` ipc: allocate pipe objects from a slab cache<br>`8b1ba86` docs: record slab implementation and verification results<br>`5a4e89c` test: avoid uninitialized pointer reads in slab T2<br>`9108f2f` mm: add quiescent slab cache destruction<br>`1ad4b39` test: cover slab lifecycle layout and repeated reclaim<br>`92eabdc` test: stress pipe slab allocation on multiple harts<br>`c6f8cb0` docs: record slab completion and verification results<br>mm: count shrink-reclaimed pages in slab statistics（本次统计修正） |
 | 修改文件 | 新增 [`kernel/slab.c`](kernel/slab.c)、[`user/pstress.c`](user/pstress.c)；修改 [`kernel/defs.h`](kernel/defs.h#L70-L82)、[`kernel/main.c`](kernel/main.c#L20)、[`kernel/pipe.c`](kernel/pipe.c#L22-L97)、[`Makefile`](Makefile#L11) |
 | 调试宏 | `SLAB_SELFTEST`（T1–T9 自测）、`SLAB_PANIC_CASE=1..5`（预期 panic），生产构建不定义 |
 | 页来源 | 仅 `buddy_alloc(0)` / `buddy_free(page, 0)`，未修改 `kalloc.c` |
@@ -67,6 +67,16 @@ cache->lock -> buddy.lock  （增长时可持有 cache 锁进入 Buddy）
 三种链表状态（[`slab.c:30-35`](kernel/slab.c#L30-L35)）：`SLAB_NONE`、`SLAB_FREE`、`SLAB_PARTIAL`、`SLAB_FULL`。每个 slab 一页，页首是 [`struct slab`](kernel/slab.c#L37-L47)，包含 magic、所属 cache、链表指针、页内 freelist、`inuse/total`、状态和 256 位分配位图；[`struct slab_list`](kernel/slab.c#L49-L52) 保存链表头与节点数。
 
 cache 描述符见 [`slab.c:54-72`](kernel/slab.c#L54-L72)：名称、`object_size/stride/align/object_offset/objects_per_slab`、三条 slab 链表、`live_objects` 与 alloc/free/grow/reap/fail 统计。描述符来自固定数组 [`caches[16]`](kernel/slab.c#L74)，由 [`caches_lock`](kernel/slab.c#L75) 保护创建/销毁，避免“用 Slab 分配描述符”的启动递归。
+
+统计语义：
+
+```text
+nr_grow：当前 cache 生命周期内从 Buddy 获取的 slab 页数。
+nr_reap：当前 cache 生命周期内通过自动回收或
+         kmem_cache_shrink() 归还给 Buddy 的 slab 页数。
+```
+
+`kmem_cache_destroy()` 随描述符清零一起丢弃统计，不要求保留计数。
 
 位图的作用：可靠识别重复释放，并让检查器交叉验证 `inuse`、位图与 freelist（[`bitmap_popcount()`](kernel/slab.c#L119)）。
 
@@ -144,9 +154,9 @@ slab pipe: size 552 stride 552 align 8 off 88 per-slab 7
 
 ### 5.5 shrink 与 destroy
 
-[`kmem_cache_shrink()`](kernel/slab.c#L550)（L550-572）：循环摘除所有 `SLAB_FREE` slab，锁外逐页 `buddy_free`，返回归还页数；不回收 partial/full。
+[`kmem_cache_shrink()`](kernel/slab.c#L550)（L550-573）：循环摘除所有 `SLAB_FREE` slab，每页在锁内递增 `nr_reap`，`buddy_free` 在锁外逐页执行，返回归还页数；不回收 partial/full。
 
-[`kmem_cache_destroy()`](kernel/slab.c#L581)（L581-604）是新增的静默生命周期接口：
+[`kmem_cache_destroy()`](kernel/slab.c#L582)（L582-605）是新增的静默生命周期接口：
 
 ```c
 // Destroy a cache.  This is a quiescent interface: the caller must
@@ -211,7 +221,7 @@ kmem_cache_destroy(struct kmem_cache *cache)
 | freelist 无环、无重复、槽合法且 bit 为 0、长度 == `total-inuse` | [`slab_check_freelist`](kernel/slab.c#L252) |
 | 三链在用对象汇总 == `live_objects`，实际节点数 == `count` | [`L310-L316`](kernel/slab.c#L310-L316) |
 
-[`kmem_cache_check()`](kernel/slab.c#L616) 只加一次锁；[`kmem_cache_dump()`](kernel/slab.c#L630) 在锁内打印布局与统计。
+[`kmem_cache_check()`](kernel/slab.c#L617) 只加一次锁；[`kmem_cache_dump()`](kernel/slab.c#L631) 在锁内打印布局与统计。
 
 ## 6. 回收策略与设计取舍
 
@@ -265,7 +275,7 @@ pipeinit(void)
 
 ### 8.1 内核自测（`SLAB_SELFTEST`）
 
-在 `slabinit()` 末尾运行（[`slab_selftest()`](kernel/slab.c#L1180)）：
+在 `slabinit()` 末尾运行（[`slab_selftest()`](kernel/slab.c#L1185)）：
 
 | 用例 | 内容 | 实际输出 |
 |---|---|---|
@@ -274,14 +284,14 @@ pipeinit(void)
 | T3 | 跨 slab（`n+3` 个对象）与状态迁移：full+partial、热页保留、idle 时全部回收 | `slab: T3 ok (62 objects/slab)` |
 | T4 | 16/24/64/128/512/1024 字节 6 种 cache，跨页、对齐、边界字节、两两不重叠 | `slab: T4 ok` |
 | T5 | 固定种子 xorshift、256 记录槽、5000 次混合分配释放、每 100 次 check | `slab: T5 ok` |
-| T6 | 两个 slab：空 slab 热保留、`shrink` 精确归还一张、释放后页数恢复 | `slab: T6 ok` |
+| T6 | 两个 slab：空 slab 热保留、`shrink` 精确归还一张；同时验证 shrink 返回值、`nr_reap` 增量和 Buddy 空闲页增量均为 1 | `slab: T6 ok` |
 | T7 | cache 生命周期：busy destroy 返回 -1、正常 destroy、槽位复用（>16 次创建/销毁） | `slab: T7 ok` |
 | T8 | 边界布局：size 1/15/16/17/24/64/512/1024 与 align 0/8/16/64/PGSIZE；非法参数不占槽 | `slab: T8 ok` |
 | T9 | 8 轮跨 slab 增长/乱序释放：每轮 `grow == reap`、页数恢复、check 通过 | `slab: T9 ok` |
 
 ### 8.2 预期 panic（`SLAB_PANIC_CASE=1..5`）
 
-每次启动只跑一个（[`slab_panic_test()`](kernel/slab.c#L1206)）：
+每次启动只跑一个（[`slab_panic_test()`](kernel/slab.c#L1211)）：
 
 | 用例 | 操作 | 实际 panic 文本 |
 |---|---|---|
