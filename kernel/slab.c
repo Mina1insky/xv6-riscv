@@ -691,7 +691,7 @@ slab_test_basic(void)
 {
   struct kmem_cache *c;
   void *p[3];
-  int i;
+  int i, j;
 
   c = kmem_cache_create("t2", 64, 0);
   if (c == 0)
@@ -703,8 +703,9 @@ slab_test_basic(void)
       panic("slab test t2 alloc");
     if (((uint64)p[i] & (c->align - 1)) != 0)
       panic("slab test t2 align");
-    if (i > 0 && (p[0] == p[1] || p[0] == p[2] || p[1] == p[2]))
-      panic("slab test t2 distinct");
+    for (j = 0; j < i; j++)
+      if (p[i] == p[j])
+        panic("slab test t2 distinct");
     memset(p[i], 0x5a + i, c->stride);
   }
   if (c->live_objects != 3)
