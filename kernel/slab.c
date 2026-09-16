@@ -732,6 +732,10 @@ slab_test_create(void)
 
   if (!kmem_cache_check(c))
     panic("slab test t1 check");
+  if (kmem_cache_destroy(c) != 0)
+    panic("slab test t1 destroy");
+  if (slab_test_used_slots() != before)
+    panic("slab test t1 slots restore");
   printk("slab: T1 ok\n");
 }
 
@@ -769,7 +773,8 @@ slab_test_basic(void)
     panic("slab test t2 restore");
   if (!kmem_cache_check(c))
     panic("slab test t2 final check");
-  kmem_cache_shrink(c);
+  if (kmem_cache_destroy(c) != 0)
+    panic("slab test t2 destroy");
   printk("slab: T2 ok\n");
 }
 
@@ -817,7 +822,8 @@ slab_test_cross(void)
     panic("slab test t3 idle reap");
   if (!kmem_cache_check(c))
     panic("slab test t3 final check");
-  kmem_cache_shrink(c);
+  if (kmem_cache_destroy(c) != 0)
+    panic("slab test t3 destroy");
   printk("slab: T3 ok (%d objects/slab)\n", n);
 }
 
@@ -867,7 +873,8 @@ slab_test_sizes(void)
       kmem_cache_free(c, slab_test_rec[i]);
     if (!kmem_cache_check(c))
       panic("slab test t4 final check");
-    kmem_cache_shrink(c);
+    if (kmem_cache_destroy(c) != 0)
+      panic("slab test t4 destroy");
   }
   printk("slab: T4 ok\n");
 }
@@ -928,7 +935,8 @@ slab_test_stress(void)
     panic("slab test t5 live");
   if (!kmem_cache_check(c))
     panic("slab test t5 final check");
-  kmem_cache_shrink(c);
+  if (kmem_cache_destroy(c) != 0)
+    panic("slab test t5 destroy");
   printk("slab: T5 ok\n");
 }
 
@@ -945,24 +953,227 @@ slab_test_buddy(void)
     panic("slab test t6 create");
   n = c->objects_per_slab;
 
-  for (i = 0; i < 3 * n; i++) {
+  for (i = 0; i < n + 3; i++) {
     slab_test_rec[i] = kmem_cache_alloc(c);
     if (slab_test_rec[i] == 0)
       panic("slab test t6 alloc");
   }
-  if (buddy_free_pages() >= before)
+  if (buddy_free_pages() != before - 2)
     panic("slab test t6 grow");
   if (!kmem_cache_check(c))
     panic("slab test t6 check");
 
-  for (i = 0; i < 3 * n; i++)
+  // Empty the second slab; it stays hot while the first is full.
+  for (i = n; i < n + 3; i++)
     kmem_cache_free(c, slab_test_rec[i]);
-  kmem_cache_shrink(c);
+  if (buddy_free_pages() != before - 2)
+    panic("slab test t6 hot");
+
+  // shrink returns exactly the empty slab.
+  if (kmem_cache_shrink(c) != 1)
+    panic("slab test t6 shrink");
+  if (buddy_free_pages() != before - 1)
+    panic("slab test t6 shrink pages");
+
+  for (i = 0; i < n; i++)
+    kmem_cache_free(c, slab_test_rec[i]);
   if (buddy_free_pages() != before)
     panic("slab test t6 restore");
   if (!buddy_check())
     panic("slab test t6 buddy");
+  if (kmem_cache_destroy(c) != 0)
+    panic("slab test t6 destroy");
   printk("slab: T6 ok\n");
+}
+
+// T7: cache lifecycle, busy destruction and descriptor slot reuse.
+static void
+slab_test_lifecycle(void)
+{
+  struct kmem_cache *c;
+  void *p;
+  int before = slab_test_used_slots();
+  int i;
+
+  if (kmem_cache_destroy(0) != -1)
+    panic("slab test t7 null");
+
+  c = kmem_cache_create("t7", 64, 0);
+  if (c == 0)
+    panic("slab test t7 create");
+  if (slab_test_used_slots() != before + 1)
+    panic("slab test t7 slot");
+
+  p = kmem_cache_alloc(c);
+  if (p == 0)
+    panic("slab test t7 alloc");
+  if (kmem_cache_destroy(c) != -1)
+    panic("slab test t7 busy");
+  kmem_cache_free(c, p);
+  if (kmem_cache_destroy(c) != 0)
+    panic("slab test t7 destroy");
+  if (slab_test_used_slots() != before)
+    panic("slab test t7 restore");
+  if (kmem_cache_destroy(c) != -1)
+    panic("slab test t7 double destroy");
+
+  for (i = 0; i < 2 * KMEM_CACHE_MAX + 4; i++) {
+    c = kmem_cache_create("t7r", 32, 0);
+    if (c == 0)
+      panic("slab test t7 reuse");
+    if (kmem_cache_destroy(c) != 0)
+      panic("slab test t7 reuse destroy");
+  }
+  if (slab_test_used_slots() != before)
+    panic("slab test t7 slots restore");
+  printk("slab: T7 ok\n");
+}
+
+static uint
+slab_test_align_up(uint value, uint align)
+{
+  return (value + align - 1) & ~(align - 1);
+}
+
+// T8: boundary sizes, alignments and layout failures.
+static void
+slab_test_boundary(void)
+{
+  static const uint sizes[] = {1, 15, 16, 17, 24, 64, 512, 1024};
+  static const uint aligns[] = {0, 8, 16, 64, PGSIZE};
+  struct kmem_cache *c;
+  int before = slab_test_used_slots();
+  uint k, sz, stride, offset, count;
+  void *p;
+
+  for (k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+    char name[KMEM_CACHE_NAME_LEN];
+
+    name[0] = 't';
+    name[1] = '8';
+    name[2] = (char)('a' + k);
+    name[3] = 0;
+    c = kmem_cache_create(name, sizes[k], 0);
+    if (c == 0)
+      panic("slab test t8 create");
+
+    sz = sizes[k] < SLAB_MIN_STRIDE ? SLAB_MIN_STRIDE : sizes[k];
+    stride = slab_test_align_up(sz, 8);
+    offset = slab_test_align_up(sizeof(struct slab), 8);
+    count = (PGSIZE - offset) / stride;
+    if (count > SLAB_MAX_OBJECTS)
+      count = SLAB_MAX_OBJECTS;
+    if (c->stride != stride || c->object_offset != offset ||
+        c->objects_per_slab != count)
+      panic("slab test t8 layout");
+    if ((uint64)offset + (uint64)stride * count > PGSIZE)
+      panic("slab test t8 overflow");
+
+    p = kmem_cache_alloc(c);
+    if (p == 0)
+      panic("slab test t8 alloc");
+    if (((uint64)p & (c->align - 1)) != 0)
+      panic("slab test t8 addr");
+    ((char *)p)[0] = 0x11;
+    ((char *)p)[stride - 1] = 0x22;
+    kmem_cache_free(c, p);
+    if (kmem_cache_destroy(c) != 0)
+      panic("slab test t8 destroy");
+  }
+
+  for (k = 0; k < sizeof(aligns) / sizeof(aligns[0]); k++) {
+    char name[KMEM_CACHE_NAME_LEN];
+
+    name[0] = 't';
+    name[1] = '8';
+    name[2] = 'b';
+    name[3] = (char)('a' + k);
+    name[4] = 0;
+    c = kmem_cache_create(name, 120, aligns[k]);
+    if (aligns[k] == PGSIZE) {
+      if (c != 0)
+        panic("slab test t8 align page");
+      continue;
+    }
+    if (c == 0)
+      panic("slab test t8 align create");
+    p = kmem_cache_alloc(c);
+    if (p == 0)
+      panic("slab test t8 align alloc");
+    if (((uint64)p & (aligns[k] ? aligns[k] - 1 : sizeof(void *) - 1)) != 0)
+      panic("slab test t8 align addr");
+    kmem_cache_free(c, p);
+    if (kmem_cache_destroy(c) != 0)
+      panic("slab test t8 align destroy");
+  }
+
+  // These must all fail without consuming a descriptor slot.
+  if (kmem_cache_create("t8z0", 0, 0) != 0)
+    panic("slab test t8 size0");
+  if (kmem_cache_create("t8z1", 64, 24) != 0)
+    panic("slab test t8 align bad");
+  if (kmem_cache_create("t8z2", 64, 2 * PGSIZE) != 0)
+    panic("slab test t8 align big");
+  if (kmem_cache_create("t8z3", PGSIZE, 0) != 0)
+    panic("slab test t8 too big");
+  if (kmem_cache_create("t8z4",
+                        PGSIZE - (uint)sizeof(struct slab) + 1, 0) != 0)
+    panic("slab test t8 no room");
+  if (slab_test_used_slots() != before)
+    panic("slab test t8 slots");
+  printk("slab: T8 ok\n");
+}
+
+// T9: repeated grow/reap cycles across slabs.
+static void
+slab_test_repeat(void)
+{
+  struct kmem_cache *c;
+  uint64 before = buddy_free_pages();
+  uint n, i, it;
+  int k;
+
+  c = kmem_cache_create("t9", 128, 0);
+  if (c == 0)
+    panic("slab test t9 create");
+  n = c->objects_per_slab;
+  if (n + 2 > 3 * SLAB_MAX_OBJECTS)
+    panic("slab test t9 size");
+
+  for (it = 0; it < 8; it++) {
+    uint64 grow0 = c->nr_grow;
+    uint64 reap0 = c->nr_reap;
+
+    for (i = 0; i < n + 2; i++) {
+      slab_test_rec[i] = kmem_cache_alloc(c);
+      if (slab_test_rec[i] == 0)
+        panic("slab test t9 alloc");
+      ((char *)slab_test_rec[i])[c->stride - 1] = (char)it;
+    }
+    if (c->full.count < 1 || c->partial.count < 1)
+      panic("slab test t9 states");
+    if (!kmem_cache_check(c))
+      panic("slab test t9 check");
+
+    // Deterministic out-of-order free: even indices, then odd indices.
+    for (k = 0; k < 2; k++)
+      for (i = (uint)k; i < n + 2; i += 2)
+        kmem_cache_free(c, slab_test_rec[i]);
+
+    if (c->live_objects != 0 || c->free.count != 0 ||
+        c->partial.count != 0 || c->full.count != 0)
+      panic("slab test t9 drain");
+    if (c->nr_grow - grow0 != c->nr_reap - reap0)
+      panic("slab test t9 balance");
+    if (!kmem_cache_check(c))
+      panic("slab test t9 final check");
+    if (buddy_free_pages() != before)
+      panic("slab test t9 pages");
+  }
+
+  if (kmem_cache_destroy(c) != 0)
+    panic("slab test t9 destroy");
+  printk("slab: T9 ok\n");
 }
 
 static void
@@ -976,7 +1187,12 @@ slab_selftest(void)
   slab_test_sizes();
   slab_test_stress();
   slab_test_buddy();
+  slab_test_lifecycle();
+  slab_test_boundary();
+  slab_test_repeat();
 
+  if (slab_test_used_slots() != 0)
+    panic("slab selftest slots");
   if (buddy_free_pages() != before)
     panic("slab selftest leak");
   if (!buddy_check())
@@ -990,14 +1206,16 @@ static void
 slab_panic_test(void)
 {
 #if SLAB_PANIC_CASE == 1
-  // P1: double free.
+  // P1: double free.  Keep a second object alive so the slab is not
+  // reaped between the two frees and the bitmap check is reached.
   struct kmem_cache *c = kmem_cache_create("p1", 64, 0);
-  void *p;
+  void *p, *q;
 
   if (c == 0)
     panic("slab panic test create");
   p = kmem_cache_alloc(c);
-  if (p == 0)
+  q = kmem_cache_alloc(c);
+  if (p == 0 || q == 0)
     panic("slab panic test alloc");
   kmem_cache_free(c, p);
   kmem_cache_free(c, p);
