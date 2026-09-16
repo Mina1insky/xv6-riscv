@@ -73,6 +73,7 @@ struct kmem_cache* kmem_cache_create(char*, uint, uint);
 void*           kmem_cache_alloc(struct kmem_cache*);
 void            kmem_cache_free(struct kmem_cache*, void*);
 uint            kmem_cache_shrink(struct kmem_cache*);
+int             kmem_cache_destroy(struct kmem_cache*);
 int             kmem_cache_check(struct kmem_cache*);
 void            kmem_cache_dump(struct kmem_cache*);
 #ifdef SLAB_SELFTEST

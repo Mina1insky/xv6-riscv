@@ -1,6 +1,16 @@
 // Slab allocator: caches of fixed-size objects carved out of single
 // Buddy pages.  The Buddy allocator provides and reclaims the pages;
 // this layer multiplexes small objects inside each page.
+//
+// Locking rules:
+//   caches_lock protects only cache descriptor slot creation, destruction
+//   and enumeration.
+//   cache->lock protects one cache's slab lists, freelists, bitmap and
+//   counters.  While holding it, slab growth may call buddy_alloc(0), so
+//   the lock order is cache->lock -> buddy.lock.  Pages are returned to
+//   Buddy only after they have been removed from every cache list, had
+//   their magic cleared, and cache->lock has been dropped; a page is
+//   never touched again after buddy_free().  Buddy never calls into Slab.
 
 #include "types.h"
 #include "param.h"
@@ -560,6 +570,46 @@ kmem_cache_shrink(struct kmem_cache *cache)
     n++;
   }
   return n;
+}
+
+// Destroy a cache.  This is a quiescent interface: the caller must
+// guarantee that no other CPU is concurrently allocating from or freeing
+// to this cache.  Returns 0 on success, or -1 if the cache is invalid or
+// still has objects in use.  All empty slabs are returned to Buddy and
+// the descriptor slot becomes reusable.
+int
+kmem_cache_destroy(struct kmem_cache *cache)
+{
+  struct slab *s;
+
+  // Reading used without cache->lock is safe only because the caller
+  // guarantees quiescence (see the comment above).
+  if (cache == 0 || !cache->used || !slab_ready)
+    return -1;
+
+  for (;;) {
+    acquire(&cache->lock);
+    if (cache->live_objects != 0 ||
+        cache->partial.count != 0 || cache->full.count != 0) {
+      release(&cache->lock);
+      return -1;
+    }
+    if (cache->free.head == 0) {
+      release(&cache->lock);
+      break;
+    }
+    s = cache->free.head;
+    slab_list_del(&cache->free, s, SLAB_FREE);
+    s->magic = 0;
+    release(&cache->lock);
+    buddy_free(s, 0);
+  }
+
+  acquire(&caches_lock);
+  memset(cache, 0, sizeof(*cache));
+  cache->used = 0;
+  release(&caches_lock);
+  return 0;
 }
 
 int
